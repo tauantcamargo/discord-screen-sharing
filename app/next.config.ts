@@ -36,11 +36,26 @@ const nextConfig: NextConfig = {
   // workspaces; um arquivo gerado a cada build entrando no git é ruído.
   agentRules: false,
 
+  // Sem otimização de imagem no servidor: o app não usa next/image, e o
+  // endpoint /_next/image é a superfície de várias falhas conhecidas do Next
+  // (SSRF, DoS e execução remota via SVG/AVIF). Desligado, ele não existe.
+  images: { unoptimized: true },
+
+  // Não anunciar a versão do framework em cada resposta.
+  poweredByHeader: false,
+
   async headers() {
     return [
       {
         source: '/:path*',
         headers: [
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          // A página de captura tem o token de transmissor na query (/share?t=).
+          // Sem isto, qualquer link externo clicado ali o levaria no Referer.
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          // HTTPS por um ano. Navegador ignora este cabeçalho em http://, então
+          // não atrapalha o localhost.
+          { key: 'Strict-Transport-Security', value: 'max-age=31536000' },
           {
             // Uma Activity roda dentro de um iframe em <id>.discordsays.com,
             // que por sua vez está dentro do discord.com. Declarar essa cadeia
