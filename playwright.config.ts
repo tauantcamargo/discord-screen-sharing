@@ -55,6 +55,8 @@ export default defineConfig({
         FEEDBACK_CHANNEL_ID: '1561141729648840754',
         FEEDBACK_GUILD_ID: '576022672983457802',
         FEEDBACK_RATE_GLOBAL: '100000',
+        // Os testes fazem centenas de pedidos do mesmo endereço.
+        ABUSE_LIMITS: 'off',
       },
     },
   ],

@@ -42,7 +42,7 @@ export default function Termos() {
       </p>
       <p>
         O código é aberto e está em{" "}
-        <a href="https://github.com/Jc007zZ/discord-screen">github.com/Jc007zZ/discord-screen</a>.
+        <a href="https://github.com/tauantcamargo/discord-screen-sharing">github.com/tauantcamargo/discord-screen-sharing</a>.
         Estes termos valem para a instância operada neste endereço; quem instalar o programa em
         servidor próprio é responsável pela instalação dele.
       </p>
@@ -169,12 +169,9 @@ export default function Termos() {
       <h2>15. Contato</h2>
       <ul>
         <li>
-          E-mail: <a href="mailto:contato@exemplo.com">contato@exemplo.com</a>
-        </li>
-        <li>
           Repositório:{" "}
-          <a href="https://github.com/Jc007zZ/discord-screen/issues">
-            github.com/Jc007zZ/discord-screen/issues
+          <a href="https://github.com/tauantcamargo/discord-screen-sharing/issues">
+            github.com/tauantcamargo/discord-screen-sharing/issues
           </a>
         </li>
       </ul>

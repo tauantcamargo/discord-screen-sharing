@@ -35,6 +35,7 @@ export function json(res: ServerResponse, status: number, obj: unknown): void {
     // Tudo que sai daqui é token, identidade ou lista de sala viva. Nada disso
     // sobrevive a um cache intermediário sem virar bug.
     'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
   });
   res.end(body);
 }
@@ -47,7 +48,8 @@ export const fail = (
 ): void => json(res, status, { error: message, ...extra });
 
 export function redirect(res: ServerResponse, to: string): void {
-  res.writeHead(302, { Location: to, 'Cache-Control': 'no-store' });
+  // no-referrer: o destino pode carregar crachá no fragmento ou token na query.
+  res.writeHead(302, { Location: to, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
   res.end();
 }
 

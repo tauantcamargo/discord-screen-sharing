@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 
 import { fail, json, redirect } from './http.ts';
 import type { Context, Handler } from './http.ts';
+import { clientIp, hit } from './limits.ts';
 import { sign, verify } from './tokens.ts';
 import * as rooms from './rooms.ts';
 import * as discord from './discord.ts';
@@ -47,6 +48,21 @@ function issueIdentity(
   };
 }
 
+/**
+ * Freio por endereço. Responde 429 e devolve true quando estourou.
+ *
+ * Toda rota que cria estado em memória (sala, convidado) ou gasta CPU (hash de
+ * senha) passa por aqui: sem isto, um laço de requisições vira RAM e CPU do
+ * mesmo processo que faz o relay de vídeo.
+ */
+function limited(ctx: Context, bucket: string, max: number, windowMs: number): boolean {
+  const wait = hit(`${bucket}:${clientIp(ctx.req)}`, max, windowMs);
+  if (wait === null) return false;
+  ctx.res.setHeader('Retry-After', String(wait));
+  fail(ctx.res, 429, `Muitas tentativas. Tente de novo em ${wait}s.`, { retryAfter: wait });
+  return true;
+}
+
 /** Valida o token de identidade que acompanha toda operação de sala. */
 function identityOf(ctx: Context): Claims | null {
   const claims = verify(ctx.body.identity);
@@ -60,19 +76,23 @@ function identityOf(ctx: Context): Claims | null {
 /**
  * Tokens de acesso a uma sala, emitidos depois de passar pela senha.
  *
- * Sem prazo de validade: quem entrou fica. A sala fecha ao esvaziar e o id é
- * aleatório, então o token morre junto com ela.
+ * Com prazo (12 h): o id da sala de uma call é derivado do canal, então ele
+ * se repete quando a sala é recriada — sem prazo, um token antigo (de quem foi
+ * expulso da call, ou vazado num log) abriria a sala para sempre. 12 h cobre
+ * qualquer sessão real; depois disso basta reabrir a atividade.
  *
  * O shareUrl aponta para /share, servido pelo app — a página de captura
  * precisa abrir fora do iframe do Discord, e é o PUBLIC_ORIGIN que garante
  * isso. Ele é o endereço da porta de entrada, não o deste processo.
  */
+const ROOM_TOKEN_TTL = 12 * 60 * 60;
+
 function roomTokens(roomId: string, me: Claims) {
   const base = { room: roomId, uid: me.uid, name: me.name, av: me.av ?? null };
   return {
     roomId,
-    viewerToken: sign({ ...base, role: 'viewer' }),
-    shareUrl: `${PUBLIC_ORIGIN}/share?t=${encodeURIComponent(sign({ ...base, role: 'broadcaster' }))}`,
+    viewerToken: sign({ ...base, role: 'viewer' }, ROOM_TOKEN_TTL),
+    shareUrl: `${PUBLIC_ORIGIN}/share?t=${encodeURIComponent(sign({ ...base, role: 'broadcaster' }, ROOM_TOKEN_TTL))}`,
   };
 }
 
@@ -118,15 +138,25 @@ const exchangeToken: Handler = async ({ res, body }) => {
   json(res, 200, { access_token: accessToken });
 };
 
-const session: Handler = async ({ res, body }) => {
+const session: Handler = async (ctx) => {
+  const { res, body } = ctx;
+  if (limited(ctx, 'session', 30, 60_000)) return;
+
   const accessToken = str(body.access_token);
   const instanceId = str(body.instance_id);
-  if (!accessToken || !instanceId) {
+  if (!accessToken || !instanceId || instanceId.length > 128) {
     return fail(res, 400, 'access_token e instance_id obrigatorios');
   }
 
-  const me = await discord.profileOf(accessToken);
+  // Só token emitido para ESTA aplicação abre sessão.
+  const me = await discord.authorizedProfile(accessToken);
   if (!me) return fail(res, 401, 'token invalido');
+
+  // Com o bot configurado, o Discord confirma que a pessoa está na instância
+  // que ela alega. Sem bot, o id da instância vale pelo próprio segredo.
+  if ((await discord.inActivityInstance(instanceId, me.id)) === 'out') {
+    return fail(res, 403, 'Abra a atividade pela call antes de entrar.');
+  }
 
   const channelId = str(body.channel_id);
   const presence = await discord.inVoiceChannel(str(body.guild_id), channelId, me.id);
@@ -168,7 +198,11 @@ const devSession: Handler = ({ res, body }) => {
  * salas que ele criou, e perder isso no meio do uso seria pior que o risco de
  * um token de convidado antigo, que não dá acesso a nada além do lobby público.
  */
-const guestSession: Handler = ({ res, body }) => {
+const guestSession: Handler = (ctx) => {
+  const { res, body } = ctx;
+  // Convidado é de graça e cada um pode criar salas: o teto é por endereço.
+  if (limited(ctx, 'guest', 20, 10 * 60_000)) return;
+
   // str(), e não String(): o corpo vem de fora e `name` pode ser objeto —
   // String({}) viraria o nome "[object Object]" em vez de cair no padrão.
   const raw = (str(body.name) ?? '').replace(/\s+/g, ' ').trim().slice(0, 32);
@@ -191,11 +225,12 @@ const list: Handler = ({ res, body }) => {
   json(res, 200, { rooms: rooms.listRooms(instance) });
 };
 
-const create: Handler = (ctx) => {
+const create: Handler = async (ctx) => {
+  if (limited(ctx, 'create', 10, 60_000)) return;
   const me = identityOf(ctx);
   if (!me) return;
 
-  const result = rooms.createRoom({
+  const result = await rooms.createRoom({
     instance: instanceOf(me),
     name: str(ctx.body.name),
     ownerId: me.uid,
@@ -303,7 +338,8 @@ const callRoom: Handler = async (ctx) => {
   json(ctx.res, 200, roomTokens(room.id, me));
 };
 
-const join: Handler = (ctx) => {
+const join: Handler = async (ctx) => {
+  if (limited(ctx, 'join', 30, 60_000)) return;
   const me = identityOf(ctx);
   if (!me) return;
 
@@ -323,7 +359,7 @@ const join: Handler = (ctx) => {
   // Salas comuns: as de um canal de voz não aparecem nem abrem em outro.
   if (room.instance !== instanceOf(me)) return fail(ctx.res, 404, 'Sala não existe mais.');
 
-  const verdict = rooms.checkPassword(room, str(ctx.body.password));
+  const verdict = await rooms.checkPassword(room, me.uid, str(ctx.body.password));
   if (!verdict.ok) {
     const locked = verdict.reason === 'locked';
     return fail(
@@ -339,7 +375,8 @@ const join: Handler = (ctx) => {
   json(ctx.res, 200, roomTokens(room.id, me));
 };
 
-const password: Handler = (ctx) => {
+const password: Handler = async (ctx) => {
+  if (limited(ctx, 'password', 10, 60_000)) return;
   const me = identityOf(ctx);
   if (!me) return;
 
@@ -348,7 +385,7 @@ const password: Handler = (ctx) => {
     return fail(ctx.res, 404, 'Sala não existe mais.');
   }
 
-  const error = rooms.setPassword(room, me.uid, str(ctx.body.password) ?? null);
+  const error = await rooms.setPassword(room, me.uid, str(ctx.body.password) ?? null);
   if (error) return fail(ctx.res, 403, error);
 
   json(ctx.res, 200, { ok: true, locked: Boolean(room.password) });
@@ -370,25 +407,64 @@ function safeRedirect(raw: string | null): string {
   return /^\/[0-9]{0,21}$/.test(raw) ? raw : '/';
 }
 
+/**
+ * O `state` do OAuth carrega um nonce amarrado a este navegador por cookie.
+ *
+ * Sem isto, alguém inicia o login com a própria conta, para no callback e
+ * manda o link para a vítima: o navegador dela termina o fluxo e passa a operar
+ * com a identidade do atacante (login CSRF). Com o nonce, o callback só aceita
+ * o fluxo que este mesmo navegador começou.
+ */
+const STATE_COOKIE = 'sdt_oauth_state';
+
+function readCookie(header: string | undefined, name: string): string | null {
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return v.join('=') || null;
+  }
+  return null;
+}
+
+function stateCookie(value: string, maxAge: number): string {
+  const secure = PUBLIC_ORIGIN.startsWith('https://') ? '; Secure' : '';
+  return `${STATE_COOKIE}=${value}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+}
+
 const login: Handler = ({ res, query }) => {
   const url = discord.loginUrl(REDIRECT_URI);
   if (!url) return fail(res, 503, 'login do Discord nao configurado');
 
-  // Para onde voltar depois. Vai no `state` do OAuth, que é o campo que existe
-  // exatamente para isto e volta intacto no callback.
+  // Para onde voltar depois. Vai no `state` do OAuth, junto do nonce.
+  const nonce = crypto.randomBytes(16).toString('base64url');
   const target = new URL(url);
-  target.searchParams.set('state', safeRedirect(query.get('goBack')));
+  target.searchParams.set('state', `${nonce}.${safeRedirect(query.get('goBack'))}`);
+  res.setHeader('Set-Cookie', stateCookie(nonce, 600));
   redirect(res, target.toString());
 };
 
-const callback: Handler = async ({ res, query }) => {
+const callback: Handler = async ({ req, res, query }) => {
+  const rawState = query.get('state') ?? '';
+  const cut = rawState.indexOf('.');
+  const nonce = cut > 0 ? rawState.slice(0, cut) : '';
+  const expected = readCookie(req.headers.cookie, STATE_COOKIE);
+  res.setHeader('Set-Cookie', stateCookie('', 0));
+  if (
+    !nonce ||
+    !expected ||
+    nonce.length !== expected.length ||
+    !crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(expected))
+  ) {
+    return redirect(res, '/?error=state_mismatch');
+  }
+
   const code = query.get('code');
   if (!code) return redirect(res, '/?error=missing_code');
 
   const accessToken = await discord.exchangeCode(code, REDIRECT_URI);
   if (!accessToken) return redirect(res, '/?error=exchange_failed');
 
-  const me = await discord.profileOf(accessToken);
+  const me = await discord.authorizedProfile(accessToken);
   if (!me) return redirect(res, '/?error=profile_failed');
 
   // 30 dias, como o crachá de convidado. Com 8 horas a pessoa reencontrava a
@@ -398,10 +474,18 @@ const callback: Handler = async ({ res, query }) => {
 
   // O `state` volta intacto do Discord, mas ele passou por fora — então é
   // conferido de novo aqui, não só na ida.
-  const back = safeRedirect(query.get('state'));
+  const back = safeRedirect(cut > 0 ? rawState.slice(cut + 1) : null);
 
   // No fragmento, não na query: o fragmento não é enviado ao servidor nem
   // aparece em log de proxy. O cliente lê e limpa da barra de endereço.
+  // Marca de "este navegador acabou de fazer login": o cliente só aceita um
+  // crachá no fragmento se ela estiver presente. Sem isto, um link
+  // `/#identity=<crachá do atacante>` colava a identidade dele em quem abrisse.
+  const secure = PUBLIC_ORIGIN.startsWith('https://') ? '; Secure' : '';
+  res.setHeader('Set-Cookie', [
+    stateCookie('', 0),
+    `sdt_login_ok=1; Path=/; SameSite=Lax; Max-Age=120${secure}`,
+  ]);
   redirect(res, `${back}#identity=${encodeURIComponent(identity)}`);
 };
 
@@ -423,7 +507,8 @@ export const routes: Record<string, Handler> = {
   'GET /auth/login': login,
   'GET /auth/callback': callback,
 
-  // Responder com o estado das salas é de propósito: um processo que responde
-  // 200 nesta rota tem servidor e relay de pé, não só a porta aberta.
-  'GET /api/health': ({ res }) => json(res, 200, { ok: true, rooms: rooms.stats() }),
+  // Responder 200 aqui prova que servidor e relay estão de pé. Só isso: a
+  // lista de salas saía nesta rota pública e entregava o id de toda instância
+  // da Activity — com ele, qualquer pessoa entrava na call de outro grupo.
+  'GET /api/health': ({ res }) => json(res, 200, { ok: true }),
 };

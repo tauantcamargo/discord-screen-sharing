@@ -37,7 +37,7 @@ export default function Privacidade() {
       <p>
         A Sala de Tela é uma atividade do Discord que permite compartilhar a tela com quem está na
         mesma sala. O código é aberto e está disponível em{" "}
-        <a href="https://github.com/Jc007zZ/discord-screen">github.com/Jc007zZ/discord-screen</a>.
+        <a href="https://github.com/tauantcamargo/discord-screen-sharing">github.com/tauantcamargo/discord-screen-sharing</a>.
       </p>
       <p>
         Esta política se aplica à instância operada neste endereço. Como o programa pode ser
@@ -272,12 +272,9 @@ export default function Privacidade() {
       </p>
       <ul>
         <li>
-          E-mail: <a href="mailto:contato@exemplo.com">contato@exemplo.com</a>
-        </li>
-        <li>
           Repositório:{" "}
-          <a href="https://github.com/Jc007zZ/discord-screen/issues">
-            github.com/Jc007zZ/discord-screen/issues
+          <a href="https://github.com/tauantcamargo/discord-screen-sharing/issues">
+            github.com/tauantcamargo/discord-screen-sharing/issues
           </a>
         </li>
       </ul>

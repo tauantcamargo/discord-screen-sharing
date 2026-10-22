@@ -13,6 +13,7 @@ import { Readable, Transform } from 'node:stream';
 import type { IncomingMessage } from 'node:http';
 
 import { fail, json } from './http.ts';
+import { clientIp, hit } from './limits.ts';
 import type { Handler } from './http.ts';
 import { verify } from './tokens.ts';
 import { getRoom } from './rooms.ts';
@@ -314,7 +315,53 @@ async function sendToDiscord(report: Report): Promise<SendResult> {
 
 // -------------------------------------------------------------------- rota
 
+// Uploads lidos ao mesmo tempo. Cada um pode ter ~40 MB em memória.
+const MAX_CONCURRENT_UPLOADS = 2;
+let uploading = 0;
+
 const submit: Handler = async ({ req, res }) => {
+  // Tudo que é barato vem antes de ler o corpo: antes, até ~40 MB eram lidos
+  // para a memória e só então se descobria que o feedback estava desligado ou
+  // que o endereço já tinha estourado o limite.
+  // O corpo é descartado em fluxo (resume), sem virar memória. Derrubar a
+  // conexão no meio do envio deixaria o cliente sem ler a resposta.
+  const refuse = (status: number, message: string, extra: Record<string, unknown>) => {
+    req.resume();
+    return fail(res, status, message, extra);
+  };
+
+  if (!DISCORD_BOT_TOKEN || !FEEDBACK_CHANNEL_ID) {
+    return refuse(503, 'O envio de feedback não está configurado neste servidor.', { code: 'feedback-off' });
+  }
+
+  const key = `ip:${clientIp(req)}`;
+  const early = rateLimited(key, RATE_MAX) ?? rateLimited('global', RATE_GLOBAL) ?? hit(`feedback-try:${key}`, 10, 10 * 60_000);
+  if (early !== null) {
+    res.setHeader('Retry-After', String(early));
+    return refuse(429, `Já chegaram relatos demais há pouco. Tente de novo em ${Math.max(1, Math.ceil(early / 60))} min.`, {
+      code: 'rate',
+      retryAfter: early,
+    });
+  }
+
+  if (uploading >= MAX_CONCURRENT_UPLOADS) {
+    res.setHeader('Retry-After', '10');
+    return refuse(503, 'Muitos envios ao mesmo tempo. Tente de novo em instantes.', { code: 'busy', retryAfter: 10 });
+  }
+
+  uploading++;
+  try {
+    await submitInner(req, res, key);
+  } finally {
+    uploading--;
+  }
+};
+
+async function submitInner(
+  req: import('node:http').IncomingMessage,
+  res: import('node:http').ServerResponse,
+  key: string
+): Promise<void> {
   const declared = Number(req.headers['content-length']);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
     res.once('finish', () => req.destroy());
@@ -395,10 +442,6 @@ const submit: Handler = async ({ req, res }) => {
   const found = roomId ? getRoom(roomId) : null;
   const room = found ? { name: found.name, call: found.isCall } : null;
 
-  // O Caddy sobrescreve o X-Forwarded-For de quem chega de fora; atrás dele o
-  // endereço do socket seria sempre o do próprio proxy.
-  const forwarded = String(req.headers['x-forwarded-for'] ?? '').split(',')[0]?.trim();
-  const key = `ip:${forwarded || req.socket.remoteAddress || '?'}`;
   const wait = rateLimited(key, RATE_MAX) ?? rateLimited('global', RATE_GLOBAL);
   if (wait !== null) {
     res.setHeader('Retry-After', String(wait));
@@ -438,9 +481,11 @@ const submit: Handler = async ({ req, res }) => {
   console.log(`[feedback] ${kind} entregue (${images.length} imagem(ns)) por ${sender?.id ?? key}`);
   json(res, 200, {
     ok: true,
-    ...(result.id ? { link: `https://discord.com/channels/${FEEDBACK_GUILD_ID}/${FEEDBACK_CHANNEL_ID}/${result.id}` } : {}),
+    ...(result.id && FEEDBACK_GUILD_ID
+      ? { link: `https://discord.com/channels/${FEEDBACK_GUILD_ID}/${FEEDBACK_CHANNEL_ID}/${result.id}` }
+      : {}),
   });
-};
+}
 
 export const rawRoutes: Record<string, Handler> = {
   'POST /api/feedback': submit,

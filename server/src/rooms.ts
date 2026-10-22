@@ -17,6 +17,9 @@
  * As mensagens JSON e o cabeçalho binário são contrato herdado — `.claude/.claude/specs/09-protocolo.md`. Nada aqui pode mudar de nome sem quebrar o cliente antigo.
  */
 import crypto from "node:crypto";
+import { promisify } from "node:util";
+
+import { LIMITS_OFF } from "./limits.ts";
 
 import type { WebSocket } from "ws";
 import type {
@@ -62,6 +65,19 @@ const MAX_VIEWERS_PER_STREAM = Number(process.env.MAX_VIEWERS_PER_STREAM) || 12;
 // Sala é objeto em memória criado por qualquer pessoa autenticada: sem teto,
 // um laço de "criar sala" consome a RAM do processo.
 const MAX_ROOMS_PER_INSTANCE = 20;
+// O teto por instância sozinho não segura: a instância vem do cliente, e
+// convidados são de graça. Por dono e no total, também.
+const MAX_ROOMS_PER_OWNER = 3;
+const MAX_ROOMS_TOTAL = 500;
+// Senha é hash scrypt: tamanho sem teto é CPU sem teto.
+const MAX_PASSWORD = 128;
+// Mensagens de controle (JSON) não são descartáveis como quadros de vídeo,
+// mas um cliente que não lê nada acumula fila sem fim na memória do servidor.
+// Passou disto, a conexão cai — o cliente reconecta e recebe o estado inteiro.
+const MAX_CONTROL_BUFFER = 8 * 1024 * 1024;
+// Anúncios de estado em rajada viram um só: um laço de rename/watch/unwatch
+// fazia o servidor reenviar a sala inteira para todo mundo a cada mensagem.
+const STATE_COALESCE_MS = 100;
 // 2 MB (4 para keyframe) era o valor herdado — e a um bitrate de 1 Mbps
 // (preset Leve) isso é **16 segundos** de vídeo enfileirado antes de o
 // servidor sequer começar a descartar. Enquanto essa fila escoa, tudo que sai
@@ -108,26 +124,58 @@ const rooms = new Map<string, Room>();
 
 // --------------------------------------------------------------------- senha
 
-function hashPassword(
+const scrypt = promisify(crypto.scrypt) as (
+  password: string,
+  salt: Buffer,
+  keylen: number,
+) => Promise<Buffer>;
+
+/**
+ * Assíncrono de propósito: o scryptSync parava o event loop por dezenas de ms a
+ * cada tentativa — e o mesmo loop é o que repassa o vídeo de todas as salas.
+ */
+async function hashPassword(
   password: string,
   salt: Buffer = crypto.randomBytes(16),
-): PasswordHash {
-  return { salt, hash: crypto.scryptSync(password, salt, 32) };
+): Promise<PasswordHash> {
+  return { salt, hash: await scrypt(password.slice(0, MAX_PASSWORD), salt, 32) };
 }
 
-function passwordMatches(room: Room, password: string): boolean {
+async function passwordMatches(room: Room, password: string): Promise<boolean> {
   if (!room.password) return true;
-  const { hash } = hashPassword(password, room.password.salt);
-  return crypto.timingSafeEqual(hash, room.password.hash);
+  const stored = room.password;
+  const { hash } = await hashPassword(password, stored.salt);
+  return crypto.timingSafeEqual(hash, stored.hash);
+}
+
+/**
+ * Tentativas por pessoa, e não pela sala inteira: antes, 5 erros de qualquer
+ * um trancavam todo mundo por 30 s — um jeito barato de impedir a entrada dos
+ * outros.
+ */
+interface AttemptState {
+  attempts: number[];
+  lockedUntil: number;
+}
+const attemptsByKey = new Map<string, AttemptState>();
+
+function attemptState(room: Room, who: string): AttemptState {
+  const key = `${room.id}:${who}`;
+  let st = attemptsByKey.get(key);
+  if (!st) {
+    st = { attempts: [], lockedUntil: 0 };
+    attemptsByKey.set(key, st);
+  }
+  return st;
 }
 
 /** null se pode tentar, ou os segundos que faltam para liberar. */
-function lockoutRemaining(room: Room): number | null {
-  if (!room.lockedUntil) return null;
-  const left = room.lockedUntil - Date.now();
+function lockoutRemaining(st: AttemptState): number | null {
+  if (!st.lockedUntil) return null;
+  const left = st.lockedUntil - Date.now();
   if (left <= 0) {
-    room.lockedUntil = 0;
-    room.attempts = [];
+    st.lockedUntil = 0;
+    st.attempts = [];
     return null;
   }
   return Math.ceil(left / 1000);
@@ -138,24 +186,26 @@ export type PasswordVerdict =
   | { ok: false; reason: "password" }
   | { ok: false; reason: "locked"; seconds: number };
 
-export function checkPassword(
+export async function checkPassword(
   room: Room,
+  who: string,
   password: string | undefined,
-): PasswordVerdict {
-  const locked = lockoutRemaining(room);
+): Promise<PasswordVerdict> {
+  const st = attemptState(room, who);
+  const locked = lockoutRemaining(st);
   if (locked !== null) return { ok: false, reason: "locked", seconds: locked };
 
-  if (passwordMatches(room, password ?? "")) {
-    room.attempts = [];
+  if (await passwordMatches(room, password ?? "")) {
+    st.attempts = [];
     return { ok: true };
   }
 
   const now = Date.now();
-  room.attempts = room.attempts.filter((t) => now - t < ATTEMPT_WINDOW_MS);
-  room.attempts.push(now);
+  st.attempts = st.attempts.filter((t) => now - t < ATTEMPT_WINDOW_MS);
+  st.attempts.push(now);
 
-  if (room.attempts.length >= MAX_ATTEMPTS) {
-    room.lockedUntil = now + LOCKOUT_MS;
+  if (st.attempts.length >= MAX_ATTEMPTS) {
+    st.lockedUntil = now + LOCKOUT_MS;
     return {
       ok: false,
       reason: "locked",
@@ -166,16 +216,20 @@ export function checkPassword(
 }
 
 /** Só o dono mexe na senha. Passar vazio remove. @returns erro, ou null. */
-export function setPassword(
+export async function setPassword(
   room: Room,
   uid: string,
   password: string | null,
-): string | null {
+): Promise<string | null> {
   if (room.ownerId !== uid) return "Só quem criou a sala pode mudar a senha.";
+  if (password && password.length > MAX_PASSWORD) {
+    return `A senha pode ter no máximo ${MAX_PASSWORD} caracteres.`;
+  }
 
-  room.password = password ? hashPassword(String(password)) : null;
-  room.attempts = [];
-  room.lockedUntil = 0;
+  room.password = password ? await hashPassword(String(password)) : null;
+  for (const key of attemptsByKey.keys()) {
+    if (key.startsWith(`${room.id}:`)) attemptsByKey.delete(key);
+  }
   broadcastState(room);
   return null;
 }
@@ -202,21 +256,31 @@ function blankRoom(id: string, instance: string, name: string): Room {
   };
 }
 
-export function createRoom(input: {
+export async function createRoom(input: {
   instance: string;
   name?: string | undefined;
   ownerId: string;
   ownerName: string;
   password?: string | null;
-}): { room: Room } | { error: string } {
-  const open = [...rooms.values()].filter(
-    (r) => r.instance === input.instance,
-  ).length;
-  if (open >= MAX_ROOMS_PER_INSTANCE) {
+}): Promise<{ room: Room } | { error: string }> {
+  const all = [...rooms.values()];
+  const open = all.filter((r) => r.instance === input.instance).length;
+  if (open >= MAX_ROOMS_PER_INSTANCE || all.length >= MAX_ROOMS_TOTAL) {
     return {
       error:
         "Limite de salas abertas atingido. Feche uma antes de criar outra.",
     };
+  }
+  if (
+    !LIMITS_OFF &&
+    all.filter((r) => r.ownerId === input.ownerId).length >= MAX_ROOMS_PER_OWNER
+  ) {
+    return {
+      error: `Você já tem ${MAX_ROOMS_PER_OWNER} salas abertas. Feche uma antes de criar outra.`,
+    };
+  }
+  if (input.password && input.password.length > MAX_PASSWORD) {
+    return { error: `A senha pode ter no máximo ${MAX_PASSWORD} caracteres.` };
   }
 
   const chosen = String(input.name ?? "")
@@ -232,7 +296,7 @@ export function createRoom(input: {
   );
   room.ownerId = input.ownerId;
   room.ownerName = input.ownerName;
-  room.password = input.password ? hashPassword(String(input.password)) : null;
+  room.password = input.password ? await hashPassword(String(input.password)) : null;
 
   rooms.set(room.id, room);
   return { room };
@@ -319,7 +383,7 @@ const sweeper = setInterval(() => {
       continue;
     }
     if (now - room.emptySince > EMPTY_GRACE_MS) {
-      rooms.delete(room.id);
+      forget(room);
       console.log(`[room ${room.id}] fechada por inatividade`);
     }
   }
@@ -330,8 +394,23 @@ sweeper.unref();
 
 function send(ws: WebSocket, data: string | Buffer): boolean {
   if (ws.readyState !== ws.OPEN) return false;
+  if (ws.bufferedAmount > MAX_CONTROL_BUFFER) {
+    ws.terminate();
+    return false;
+  }
   ws.send(data);
   return true;
+}
+
+/** Remove a sala e tudo que é indexado por ela. */
+function forget(room: Room): void {
+  rooms.delete(room.id);
+  const pending = pendingState.get(room);
+  if (pending) clearTimeout(pending);
+  pendingState.delete(room);
+  for (const key of attemptsByKey.keys()) {
+    if (key.startsWith(`${room.id}:`)) attemptsByKey.delete(key);
+  }
 }
 
 export const sendJson = (ws: WebSocket, obj: unknown): boolean =>
@@ -410,10 +489,24 @@ function roomState(room: Room) {
   };
 }
 
+const pendingState = new Map<Room, ReturnType<typeof setTimeout>>();
+
+/**
+ * Anuncia o estado da sala — coalescido: várias mudanças em 100 ms viram um
+ * anúncio só, calculado no fim com o estado mais novo.
+ */
 export function broadcastState(room: Room): void {
-  const msg = JSON.stringify(roomState(room));
-  for (const v of room.viewers.values()) send(v.ws, msg);
-  for (const b of room.broadcasters.values()) send(b.ws, msg);
+  if (pendingState.has(room)) return;
+  pendingState.set(
+    room,
+    setTimeout(() => {
+      pendingState.delete(room);
+      if (rooms.get(room.id) !== room) return;
+      const msg = JSON.stringify(roomState(room));
+      for (const v of room.viewers.values()) send(v.ws, msg);
+      for (const b of room.broadcasters.values()) send(b.ws, msg);
+    }, STATE_COALESCE_MS),
+  );
 }
 
 export function rename(room: Room, ws: WebSocket, raw: unknown): void {
@@ -725,7 +818,7 @@ export function detachViewer(room: Room, ws: WebSocket): void {
  */
 export function closeIfEmpty(room: Room): void {
   if (room.viewers.size > 0 || room.broadcasters.size > 0) return;
-  rooms.delete(room.id);
+  forget(room);
   console.log(`[room ${room.id}] fechada por quem saiu`);
 }
 

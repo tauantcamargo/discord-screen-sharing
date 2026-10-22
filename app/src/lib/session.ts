@@ -49,6 +49,14 @@ export function takeIdentityFromHash(): string | null {
   const rest = hash.toString();
   history.replaceState(null, '', `${location.pathname}${location.search}${rest ? `#${rest}` : ''}`);
 
+  // Só aceita o crachá se este navegador acabou de passar pelo callback do
+  // login (o servidor deixa a marca `sdt_login_ok` por 2 minutos). Um link
+  // `/#identity=…` montado por outra pessoa não traz a marca, e é ignorado —
+  // senão bastava mandar o link para a vítima operar com a conta de quem o fez.
+  const fromLogin = document.cookie.split(';').some((c) => c.trim() === 'sdt_login_ok=1');
+  if (!fromLogin) return null;
+  document.cookie = 'sdt_login_ok=; Path=/; Max-Age=0; SameSite=Lax';
+
   save(identity);
   return identity;
 }

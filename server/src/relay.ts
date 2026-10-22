@@ -11,6 +11,7 @@ import type { Server } from 'node:http';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 
 import { verify } from './tokens.ts';
+import { LIMITS_OFF, clientIp } from './limits.ts';
 import * as rooms from './rooms.ts';
 import type { Broadcast, CodecConfig, Claims, Person, Room } from './types.ts';
 
@@ -21,6 +22,51 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 })
 
 /** O `ws` não expõe onde guardar o "está vivo?" do heartbeat. */
 const alive = new WeakSet<WebSocket>();
+
+// ------------------------------------------------------------- freios de abuso
+//
+// Qualquer token de sala abria quantos sockets quisesse e mandava mensagens de
+// controle sem limite — cada uma podendo disparar um anúncio para a sala
+// inteira. Os tetos abaixo ficam bem acima do uso real (uma pessoa tem uma aba
+// da atividade e, no máximo, duas de captura) e bem abaixo do que derruba o
+// processo.
+const MAX_SOCKETS_PER_IP = 40;
+const MAX_SOCKETS_PER_USER = 8;
+const MAX_SOCKETS_TOTAL = 2000;
+// Mensagens de controle (JSON): balde de fichas por socket.
+const MSG_BURST = 40;
+const MSG_PER_SECOND = 20;
+// Espectador nunca precisa mandar nada grande; transmissor manda quadros.
+const MAX_CONTROL_BYTES = 16 * 1024;
+
+const socketsByIp = new Map<string, number>();
+const socketsByUser = new Map<string, number>();
+
+function bump(map: Map<string, number>, key: string, delta: number): void {
+  const n = (map.get(key) ?? 0) + delta;
+  if (n <= 0) map.delete(key);
+  else map.set(key, n);
+}
+
+/** Balde de fichas: true enquanto cabe, false quando estourou. */
+function makeBucket(): () => boolean {
+  let tokens = MSG_BURST;
+  let last = Date.now();
+  return () => {
+    if (LIMITS_OFF) return true;
+    const now = Date.now();
+    tokens = Math.min(MSG_BURST, tokens + ((now - last) / 1000) * MSG_PER_SECOND);
+    last = now;
+    if (tokens < 1) return false;
+    tokens -= 1;
+    return true;
+  };
+}
+
+function reject(socket: import('node:stream').Duplex, status: string): void {
+  socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+  socket.destroy();
+}
 
 export function mountRelay(server: Server): WebSocketServer {
   server.on('upgrade', (req, socket, head) => {
@@ -36,8 +82,18 @@ export function mountRelay(server: Server): WebSocketServer {
     const claims = verify(url.searchParams.get('t'));
     // scope 'identity' não dá acesso a sala nenhuma: só os tokens de sala servem.
     if (!claims?.room) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      reject(socket, '401 Unauthorized');
+      return;
+    }
+
+    const ip = clientIp(req);
+    if (
+      !LIMITS_OFF &&
+      (wss.clients.size >= MAX_SOCKETS_TOTAL ||
+      (socketsByIp.get(ip) ?? 0) >= MAX_SOCKETS_PER_IP ||
+        (socketsByUser.get(claims.uid) ?? 0) >= MAX_SOCKETS_PER_USER)
+    ) {
+      reject(socket, '429 Too Many Requests');
       return;
     }
 
@@ -45,7 +101,15 @@ export function mountRelay(server: Server): WebSocketServer {
     // slot têm que acontecer na conexão, antes de qualquer mensagem chegar.
     const kind = url.searchParams.get('kind') === 'camera' ? 'camera' : 'screen';
 
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req, claims, kind));
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      bump(socketsByIp, ip, 1);
+      bump(socketsByUser, claims.uid, 1);
+      ws.once('close', () => {
+        bump(socketsByIp, ip, -1);
+        bump(socketsByUser, claims.uid, -1);
+      });
+      wss.emit('connection', ws, req, claims, kind);
+    });
   });
 
   return wss;
@@ -98,12 +162,17 @@ function handleBroadcaster(ws: WebSocket, room: Room, info: Person, kind: 'scree
   const broadcast: Broadcast = attached;
   console.log(`[room ${room.id}] broadcaster conectado: ${info.name} (slot ${broadcast.slot})`);
 
+  const allow = makeBucket();
   ws.on('message', (data: RawData, isBinary: boolean) => {
     if (isBinary) {
       rooms.relayChunk(room, broadcast, toBuffer(data));
       return;
     }
 
+    if (!allow() || sizeOf(data) > MAX_CONTROL_BYTES) {
+      ws.close(1008, 'mensagens demais');
+      return;
+    }
     const msg = asJson(data);
     if (!msg) return;
 
@@ -145,8 +214,17 @@ function handleViewer(ws: WebSocket, room: Room, info: Person): void {
   /** Clicou em sair, e não simplesmente perdeu a conexão. */
   let leftOnPurpose = false;
 
+  const allow = makeBucket();
   ws.on('message', (data: RawData, isBinary: boolean) => {
-    if (isBinary) return;
+    // Espectador não tem o que mandar em binário; quem manda está adulterado.
+    if (isBinary || sizeOf(data) > MAX_CONTROL_BYTES) {
+      ws.terminate();
+      return;
+    }
+    if (!allow()) {
+      ws.close(1008, 'mensagens demais');
+      return;
+    }
 
     const msg = asJson(data);
     if (!msg) return;
@@ -225,6 +303,12 @@ function asJson(data: RawData): ControlMessage | null {
   } catch {
     return null;
   }
+}
+
+function sizeOf(data: RawData): number {
+  if (Buffer.isBuffer(data)) return data.length;
+  if (Array.isArray(data)) return data.reduce((n, b) => n + b.length, 0);
+  return data.byteLength;
 }
 
 /**

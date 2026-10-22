@@ -42,6 +42,63 @@ export async function profileOf(accessToken: string): Promise<Person | null> {
   return { id: me.id, name: me.global_name || me.username || me.id, avatar: me.avatar ?? null };
 }
 
+/**
+ * Perfil de quem autorizou **esta** aplicação.
+ *
+ * `/users/@me` aceita access_token de qualquer aplicação do Discord: um token
+ * emitido para outro app abriria sessão aqui. `/oauth2/@me` diz para qual
+ * aplicação o token foi emitido, e a sessão só vale se for a nossa.
+ *
+ * @returns null se o token não vale ou é de outra aplicação.
+ */
+export async function authorizedProfile(accessToken: string): Promise<Person | null> {
+  if (!DISCORD_CLIENT_ID) return profileOf(accessToken);
+
+  const info = (await fetch(`${API}/oauth2/@me`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(10_000),
+  })
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null)) as {
+    application?: { id?: string };
+    user?: { id?: string; global_name?: string | null; username?: string; avatar?: string | null };
+  } | null;
+
+  if (!info?.user?.id) return null;
+  if (info.application?.id !== DISCORD_CLIENT_ID) {
+    console.warn('[oauth] access_token de outra aplicacao recusado');
+    return null;
+  }
+
+  const u = info.user;
+  return { id: u.id as string, name: u.global_name || u.username || (u.id as string), avatar: u.avatar ?? null };
+}
+
+/**
+ * A pessoa está mesmo nesta instância da Activity?
+ *
+ * O `instance_id` vem do cliente. Com o token do bot dá para perguntar ao
+ * Discord quem está na instância; sem ele a resposta é 'unknown' e a
+ * instância vale só pelo segredo do próprio id (que nunca é exposto).
+ */
+export async function inActivityInstance(instanceId: string, userId: string): Promise<Presence> {
+  if (!DISCORD_BOT_TOKEN || !DISCORD_CLIENT_ID) return 'unknown';
+  try {
+    const r = await fetch(
+      `${API}/v10/applications/${DISCORD_CLIENT_ID}/activity-instances/${encodeURIComponent(instanceId)}`,
+      { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }, signal: AbortSignal.timeout(10_000) }
+    );
+    // 404 = instância que não existe: quem inventou um id cai numa sala só
+    // dele, sem ninguém dentro. Recusar aqui só trancaria gente por falha nossa.
+    if (!r.ok) return 'unknown';
+    const data = (await r.json()) as { users?: string[] };
+    if (!Array.isArray(data.users)) return 'unknown';
+    return data.users.includes(userId) ? 'in' : 'out';
+  } catch {
+    return 'unknown';
+  }
+}
+
 export function loginUrl(redirectUri: string): string | null {
   if (!DISCORD_CLIENT_ID) return null;
   const url = new URL(`${API}/oauth2/authorize`);
