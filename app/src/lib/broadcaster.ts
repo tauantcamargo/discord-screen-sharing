@@ -8,12 +8,14 @@
  */
 
 // H264 costuma ter encoder por hardware; VP8 quase sempre cai em software, que
-// a 1080p derruba o framerate. Por isso as duas variantes de H264 vêm antes:
-// annexb dispensa o blob `description`, e avcC é aceito onde annexb não é
-// (RN-TRX-12).
+// a 1080p derruba o framerate. Por isso as duas variantes de H264 vêm antes.
+// avcC (com `description`) primeiro: é o formato que todo decoder aceita —
+// inclusive o do Safari, que não decodifica H264 em Annex B sem description.
+// Como a config vai para quem assiste pelo servidor, o blob extra não custa
+// nada. Annex B fica de reserva para encoder que não emita avcC (RN-TRX-12).
 const CANDIDATES: Array<Partial<VideoEncoderConfig> & { codec: string }> = [
-  { codec: 'avc1.42E01E', avc: { format: 'annexb' } },
   { codec: 'avc1.42E01E' },
+  { codec: 'avc1.42E01E', avc: { format: 'annexb' } },
   { codec: 'vp8' },
   { codec: 'vp09.00.10.08' },
 ];
@@ -65,12 +67,77 @@ export function supportError({ requireChromium = false } = {}): string | null {
   if (!('VideoEncoder' in window) || !('VideoFrame' in window) || !('EncodedVideoChunk' in window)) {
     return 'Este navegador não tem WebCodecs, necessário para transmitir. Use Chrome, Edge ou outro navegador Chromium no desktop.';
   }
-  // Exigência de produto, não de capacidade (RN-TRX-4): o caminho via <video>
-  // funciona em Firefox e Safari, mas a captura sai visivelmente pior.
-  if (requireChromium && !('MediaStreamTrackProcessor' in window)) {
-    return 'Transmitir exige um navegador Chromium — Chrome, Edge, Brave ou Opera. Nos outros a captura fica com qualidade ruim, então está desabilitada. Você continua podendo assistir.';
-  }
+  // Antes era exigência de produto transmitir só de Chromium (RN-TRX-4). Mas o
+  // Discord abre o link de captura no navegador padrão — no Mac, quase sempre
+  // o Safari —, e recusar ali empurrava todo mundo para instalar outro
+  // navegador. Agora o Safari 18+ lê os quadros direto num worker (ver
+  // `pumpViaWorker`), com a mesma qualidade do Chromium; só o que não tem nem
+  // isso cai no caminho via <video>.
+  void requireChromium; // mantido na assinatura para não quebrar quem chama
   return null;
+}
+
+/**
+ * O Safari só expõe `MediaStreamTrackProcessor` dentro de workers — e a faixa
+ * precisa ser transferível para chegar lá. É o que este worker faz: lê os
+ * quadros da faixa e os devolve à página, transferidos (sem cópia).
+ */
+const FRAME_WORKER = `
+let reader = null;
+onmessage = async ({ data }) => {
+  if (data.type === 'stop') {
+    try { await reader?.cancel(); } catch {}
+    try { data.track?.stop?.(); } catch {}
+    return;
+  }
+  if (data.type !== 'start') return;
+  if (typeof MediaStreamTrackProcessor === 'undefined') {
+    try { data.track.stop(); } catch {}
+    postMessage({ type: 'unsupported' });
+    return;
+  }
+  const track = data.track;
+  try {
+    reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+  } catch (err) {
+    try { track.stop(); } catch {}
+    postMessage({ type: 'unsupported', message: String(err) });
+    return;
+  }
+  postMessage({ type: 'ready' });
+  for (;;) {
+    let r;
+    try { r = await reader.read(); } catch { break; }
+    if (r.done || !r.value) break;
+    postMessage({ type: 'frame', frame: r.value }, [r.value]);
+  }
+  try { track.stop(); } catch {}
+  postMessage({ type: 'done' });
+};
+`;
+
+/**
+ * Captura o som num AudioWorklet e entrega blocos Float32 planos à página.
+ * É o caminho de áudio de quem não tem `MediaStreamTrackProcessor` na janela
+ * (Safari): o AudioContext já roda a 48 kHz, então o navegador reamostra a
+ * entrada sozinho e o Opus recebe a taxa que quer.
+ */
+const AUDIO_TAP_WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input.length) {
+      const copy = input.map((ch) => ch.slice(0));
+      this.port.postMessage(copy, copy.map((c) => c.buffer));
+    }
+    return true;
+  }
+}
+registerProcessor('sdt-tap', Tap);
+`;
+
+function blobUrl(code: string): string {
+  return URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
 }
 
 export interface BroadcastStatus {
@@ -164,6 +231,12 @@ export function createBroadcaster({
   // para a interface poder oferecer a saída em vez de só avisar e esquecer.
   let soundBlocked = false;
   let video: HTMLVideoElement | null = null;
+  /** Worker que lê os quadros no Safari (ver `pumpViaWorker`). */
+  let frameWorker: Worker | null = null;
+  /** Como os quadros estão chegando — vai para o diagnóstico da página. */
+  let directCapture = 'MediaStreamTrackProcessor' in window;
+  /** Captura de som via AudioWorklet (Safari); ver `pumpAudioViaWorklet`. */
+  let audioTap: { close: () => void } | null = null;
   let config: VideoEncoderConfig | null = null;
   let stage: HTMLCanvasElement | null = null;
   let stageCtx: CanvasRenderingContext2D | null = null;
@@ -339,7 +412,8 @@ export function createBroadcaster({
    * aqui o equivalente ao keyframe (RN-AUD-1).
    */
   async function pumpAudio(track: MediaStreamTrack): Promise<void> {
-    if (!('AudioEncoder' in window) || !('MediaStreamTrackProcessor' in window)) return;
+    if (!('AudioEncoder' in window)) return;
+    if (!('MediaStreamTrackProcessor' in window)) return pumpAudioViaWorklet(track);
 
     const s = track.getSettings();
     // A taxa que a faixa relata — e não necessariamente a que se pediu.
@@ -430,6 +504,113 @@ export function createBroadcaster({
       }
       data.close();
     }
+  }
+
+  /**
+   * Som sem `MediaStreamTrackProcessor` (Safari 26+, que já tem AudioEncoder).
+   *
+   * Um AudioWorklet copia os blocos de 128 amostras; aqui eles são juntados em
+   * pacotes de 20 ms e viram `AudioData` para o mesmo encoder Opus do caminho
+   * do Chromium. O AudioContext a 48 kHz faz a reamostragem (RN-AUD-15).
+   */
+  async function pumpAudioViaWorklet(track: MediaStreamTrack): Promise<void> {
+    if (typeof AudioWorkletNode === 'undefined') return;
+
+    const sampleRate = OPUS_SAMPLE_RATE;
+    const numberOfChannels = Math.min(2, track.getSettings().channelCount ?? 2);
+    const ctx = new AudioContext({ sampleRate });
+    const url = blobUrl(AUDIO_TAP_WORKLET);
+    try {
+      await ctx.audioWorklet.addModule(url);
+    } catch (err) {
+      console.warn('[audio tap]', err instanceof Error ? err.message : err);
+      void ctx.close();
+      return;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+
+    try {
+      audioEncoder = new AudioEncoder({
+        output: onAudioEncoded,
+        error: (err) => console.warn('[audio encoder]', err.message),
+      });
+      audioEncoder.configure({ codec: 'opus', sampleRate, numberOfChannels, bitrate: AUDIO_BITRATE });
+    } catch (err) {
+      console.warn('[audio encoder]', err instanceof Error ? err.message : err);
+      audioEncoder = null;
+      void ctx.close();
+      return;
+    }
+
+    ws?.send(JSON.stringify({ type: 'audio-config', config: { codec: 'opus', sampleRate, numberOfChannels } }));
+
+    const source = ctx.createMediaStreamSource(new MediaStream([track]));
+    const node = new AudioWorkletNode(ctx, 'sdt-tap', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      channelCount: numberOfChannels,
+      channelCountMode: 'explicit',
+    });
+    // O worklet só roda se o grafo for puxado até a saída; ganho zero para
+    // não tocar o som de volta em quem transmite.
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    source.connect(node).connect(mute).connect(ctx.destination);
+    void ctx.resume().catch(() => {});
+
+    const PACKET = sampleRate / 50; // 20 ms
+    const pending: Float32Array[] = Array.from({ length: numberOfChannels }, () => new Float32Array(PACKET));
+    let filled = 0;
+    let sent = 0;
+
+    node.port.onmessage = ({ data }: MessageEvent<Float32Array[]>) => {
+      if (!running || audioEncoder?.state !== 'configured') return;
+      const frames = data[0]?.length ?? 0;
+      let offset = 0;
+      while (offset < frames) {
+        const take = Math.min(PACKET - filled, frames - offset);
+        for (let c = 0; c < numberOfChannels; c++) {
+          const ch = data[c] ?? data[0]!;
+          pending[c]!.set(ch.subarray(offset, offset + take), filled);
+        }
+        filled += take;
+        offset += take;
+        if (filled === PACKET) {
+          const planar = new Float32Array(PACKET * numberOfChannels);
+          for (let c = 0; c < numberOfChannels; c++) planar.set(pending[c]!, c * PACKET);
+          const audio = new AudioData({
+            format: 'f32-planar',
+            sampleRate,
+            numberOfFrames: PACKET,
+            numberOfChannels,
+            timestamp: Math.round((sent / sampleRate) * 1e6),
+            data: planar,
+          });
+          sent += PACKET;
+          filled = 0;
+          try {
+            audioEncoder.encode(audio);
+          } catch (err) {
+            console.warn('[audio encode]', err instanceof Error ? err.message : err);
+          }
+          audio.close();
+        }
+      }
+    };
+
+    audioTap = {
+      close: () => {
+        node.port.onmessage = null;
+        try {
+          source.disconnect();
+          node.disconnect();
+        } catch {
+          // já desconectado
+        }
+        void ctx.close().catch(() => {});
+      },
+    };
   }
 
   async function pickConfig(width: number, height: number): Promise<VideoEncoderConfig | null> {
@@ -527,7 +708,7 @@ export function createBroadcaster({
         codec: config.codec,
         width: target.width,
         height: target.height,
-        direct: 'MediaStreamTrackProcessor' in window,
+        direct: directCapture,
       });
     }
 
@@ -659,12 +840,91 @@ export function createBroadcaster({
     schedule();
   }
 
+  /**
+   * Safari 18+: os quadros são lidos num worker e transferidos para cá.
+   *
+   * Vai uma cópia (`clone`) da faixa, e não a original: se o worker não
+   * souber ler, a original continua aqui, intacta, para o caminho via <video>.
+   */
+  function pumpViaWorker(track: MediaStreamTrack): void {
+    let worker: Worker;
+    let clone: MediaStreamTrack;
+    try {
+      const url = blobUrl(FRAME_WORKER);
+      worker = new Worker(url);
+      URL.revokeObjectURL(url);
+      clone = track.clone();
+    } catch {
+      pumpViaVideo();
+      return;
+    }
+
+    let settled = false;
+    const fallback = () => {
+      if (settled) return;
+      settled = true;
+      worker.terminate();
+      if (frameWorker === worker) frameWorker = null;
+      directCapture = false;
+      if (running) pumpViaVideo();
+    };
+
+    worker.onmessage = ({ data }: MessageEvent) => {
+      if (data.type === 'frame') {
+        settled = true;
+        const frame = data.frame as VideoFrame;
+        if (frameWorker !== worker) {
+          frame.close();
+          return;
+        }
+        encodeFrame(frame);
+      } else if (data.type === 'unsupported') {
+        fallback();
+      }
+    };
+    worker.onerror = fallback;
+
+    try {
+      worker.postMessage({ type: 'start', track: clone }, [clone as unknown as Transferable]);
+    } catch {
+      // DataCloneError: este navegador não transfere faixas para workers.
+      clone.stop();
+      fallback();
+      return;
+    }
+    frameWorker = worker;
+    directCapture = true;
+    // Sem resposta em 3 s, desiste do worker e usa o <video>.
+    setTimeout(() => {
+      if (!settled) fallback();
+    }, 3000);
+  }
+
+  function stopFramePump(): void {
+    if (frameWorker) {
+      frameWorker.postMessage({ type: 'stop' });
+      const w = frameWorker;
+      frameWorker = null;
+      setTimeout(() => w.terminate(), 500);
+    }
+  }
+
   function pump(track: MediaStreamTrack): void {
-    if ('MediaStreamTrackProcessor' in window) void pumpDirect(track);
-    else pumpViaVideo();
+    if ('MediaStreamTrackProcessor' in window) {
+      directCapture = true;
+      void pumpDirect(track);
+    } else if (typeof Worker !== 'undefined' && 'VideoFrame' in window) {
+      pumpViaWorker(track);
+    } else {
+      directCapture = false;
+      pumpViaVideo();
+    }
   }
 
   function cleanup(): void {
+    stopFramePump();
+    audioTap?.close();
+    audioTap = null;
     stream?.getTracks().forEach((t) => t.stop());
     stream = null;
     video?.remove();
@@ -693,6 +953,8 @@ export function createBroadcaster({
     audioRawReader = null;
     audioResampler?.close();
     audioResampler = null;
+    audioTap?.close();
+    audioTap = null;
 
     for (const e of [encoder, audioEncoder]) {
       if (e?.state === 'configured') {
@@ -771,6 +1033,26 @@ export function createBroadcaster({
    * É aqui que a prévia se apoia: a pessoa ainda não está no ar, então trocar
    * de tela ou resolver o som barrado não custa nada a ninguém (RN-TRX-37).
    */
+  /**
+   * Pede a tela com som; se o navegador recusar o pedido de som em si (o
+   * Safari não captura áudio de tela, e versões antigas recusam a chamada
+   * inteira), pede de novo só a imagem. Cancelar o seletor não é recusa:
+   * esse erro sobe como veio.
+   */
+  async function captureDisplay(): Promise<MediaStream> {
+    try {
+      return await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: fps, max: fps } },
+        audio: audioConstraints(),
+        ...displayAudioOptions(),
+      });
+    } catch (err) {
+      const name = err instanceof Error ? err.name : '';
+      if (name !== 'TypeError' && name !== 'OverconstrainedError') throw err;
+      return navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: fps, max: fps } } });
+    }
+  }
+
   async function prepare(): Promise<Preview> {
     // Precisa vir do gesto do usuário; qualquer await antes disso o invalida
     // (RN-TRX-6).
@@ -781,11 +1063,7 @@ export function createBroadcaster({
           })
         : // Sempre pedido (RN-TRX-24c): quem decide se aquela transmissão leva
           // som é o checkbox do seletor nativo do navegador, não este código.
-          await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: { ideal: fps, max: fps } },
-            audio: audioConstraints(),
-            ...displayAudioOptions(),
-          });
+          await captureDisplay();
     stream = captured;
 
     const track = captured.getVideoTracks()[0];
@@ -850,7 +1128,7 @@ export function createBroadcaster({
       codec: config.codec,
       width: config.width,
       height: config.height,
-      direct: 'MediaStreamTrackProcessor' in window,
+      direct: directCapture,
     });
 
     statsTimer = setInterval(() => {
@@ -924,6 +1202,8 @@ export function createBroadcaster({
     audioRawReader = null;
     audioResampler?.close();
     audioResampler = null;
+    audioTap?.close();
+    audioTap = null;
     if (audioEncoder?.state === 'configured') {
       try {
         audioEncoder.close();
@@ -985,6 +1265,8 @@ export function createBroadcaster({
     audioRawReader = null;
     audioResampler?.close();
     audioResampler = null;
+    audioTap?.close();
+    audioTap = null;
     if (audioEncoder?.state === 'configured') {
       try {
         audioEncoder.close();
@@ -1007,11 +1289,7 @@ export function createBroadcaster({
    * imagem mudar, sem piscar nem reconectar.
    */
   async function changeScreen(): Promise<MediaStream> {
-    const fresh = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: fps, max: fps } },
-      audio: audioConstraints(),
-      ...displayAudioOptions(),
-    });
+    const fresh = await captureDisplay();
 
     const previous = stream;
     const previousReader = reader;
@@ -1025,6 +1303,7 @@ export function createBroadcaster({
 
     reader = null;
     await previousReader?.cancel().catch(() => {});
+    stopFramePump();
     previous?.getTracks().forEach((t) => t.stop());
 
     // Zera o tamanho conhecido: a tela nova quase certamente tem outro, e é o
@@ -1037,7 +1316,7 @@ export function createBroadcaster({
       video.srcObject = fresh;
       void video.play().catch(() => {});
     } else {
-      void pumpDirect(track);
+      pump(track);
     }
 
     // A tela nova traz a própria faixa de som; a antiga morreu com o stream.
@@ -1047,6 +1326,8 @@ export function createBroadcaster({
     audioRawReader = null;
     audioResampler?.close();
     audioResampler = null;
+    audioTap?.close();
+    audioTap = null;
     const newAudio = prepareSound(track, fresh);
     if (newAudio && audioEncoder) void pumpAudio(newAudio);
 
