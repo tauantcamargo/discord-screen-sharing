@@ -31,6 +31,7 @@ import { RoomConnection } from "@/lib/room";
 import {
   callRoom,
   createRoom,
+  fixedRoom,
   guildRoom,
   setPassword,
   forgetTokens,
@@ -74,8 +75,15 @@ const RELOAD_MS = 4000;
 /** Sem este vigia, uma espera que não termina fica com cara de "Conectando…" para sempre (RF-SES-8). */
 const SLOW_MS = 8000;
 
-export function Room({ guild }: { guild?: string } = {}) {
+export function Room({ guild, fixa }: { guild?: string; fixa?: string } = {}) {
   const { inDiscord, api, ws } = useDiscord();
+  /**
+   * Link de servidor ou link fixo: nos dois a sala é decidida pelo endereço,
+   * não há lobby, e quando a sala some a pessoa volta para a mesma.
+   */
+  const byAddress = Boolean(guild || fixa);
+  /** Para onde o login do Discord volta. */
+  const backHere = fixa ? `/s/${fixa}` : `/${guild ?? ""}`;
 
   // useState com inicializador preguiçoso, e não useRef: a conexão é lida
   // durante a renderização (o useSyncExternalStore precisa dela ali), e ler
@@ -92,6 +100,8 @@ export function Room({ guild }: { guild?: string } = {}) {
   // Em `/<id do servidor>` não há caminho de convidado: sem conta do Discord
   // não há voz para consultar. Aqui a tela é de login, não de erro.
   const [needsLogin, setNeedsLogin] = useState(false);
+  /** Link fixo aberto como convidado: oferece entrar com o Discord antes. */
+  const [chooseIdentity, setChooseIdentity] = useState(false);
   /**
    * O link aponta para uma call, e a pessoa está noutra.
    *
@@ -293,8 +303,8 @@ export function Room({ guild }: { guild?: string } = {}) {
     tokensRef.current = null;
     // Guarda o que já foi resolvido: voltar não precisa consultar o Discord de
     // novo para saber qual é a call.
-    if (guild && lastTokens) setEntrada((current) => current ?? lastTokens);
-  }, [connection, stopMyBroadcast, guild]);
+    if (byAddress && lastTokens) setEntrada((current) => current ?? lastTokens);
+  }, [connection, stopMyBroadcast, byAddress]);
 
   /**
    * O ciclo entre entrar na call e conectar, quebrado.
@@ -332,7 +342,7 @@ export function Room({ guild }: { guild?: string } = {}) {
           // Onde a sala é a da call — Activity ou link de servidor — ela é
           // recriada e a pessoa volta para ela (RF-SAL-7). Só no lobby é que
           // "a sala sumiu" significa mesmo perder o lugar.
-          if (inDiscord || guild) {
+          if (inDiscord || byAddress) {
             rejoinCall.current?.();
           } else {
             toast("A sala foi fechada.", true);
@@ -342,12 +352,12 @@ export function Room({ guild }: { guild?: string } = {}) {
         onRejected: () => {
           forgetTokens(tokens.roomId);
           toast("Sua sessão expirou. Entrando de novo…");
-          if (inDiscord || guild) rejoinCall.current?.();
+          if (inDiscord || byAddress) rejoinCall.current?.();
           else leaveRoom();
         },
       });
     },
-    [connection, ws, inDiscord, guild, toast, leaveRoom]
+    [connection, ws, inDiscord, byAddress, toast, leaveRoom]
   );
 
   /**
@@ -381,6 +391,14 @@ export function Room({ guild }: { guild?: string } = {}) {
 
   const enterGuildRoom = useCallback(
     async (identity: string) => {
+      if (fixa) {
+        try {
+          connect(await fixedRoom(api, identity, fixa, renew));
+        } catch (err) {
+          setBootFailure(err instanceof Error ? err.message : "Não consegui abrir a sala.");
+        }
+        return;
+      }
       if (!guild) return;
       try {
         const requestedRoomId = requestedRoom();
@@ -401,7 +419,7 @@ export function Room({ guild }: { guild?: string } = {}) {
         );
       }
     },
-    [guild, api, renew, connect]
+    [guild, fixa, api, renew, connect]
   );
 
   /**
@@ -470,9 +488,9 @@ export function Room({ guild }: { guild?: string } = {}) {
 
   useEffect(() => {
     rejoinCall.current = session
-      ? () => void (guild ? enterGuildRoom(session.identity) : joinCallRoom(session.identity))
+      ? () => void (byAddress ? enterGuildRoom(session.identity) : joinCallRoom(session.identity))
       : null;
-  }, [joinCallRoom, enterGuildRoom, guild, session]);
+  }, [joinCallRoom, enterGuildRoom, byAddress, session]);
 
   // ------------------------------------------------------------- arranque
 
@@ -535,7 +553,18 @@ export function Room({ guild }: { guild?: string } = {}) {
         // a entrada depender de uma renderização a mais e devolveria uma
         // cascata de re-render a cada mudança de sessão.
         if (inDiscord) await joinCallRoom(fresh.identity);
-        else if (guild) {
+        else if (fixa) {
+          // Convidado vê a escolha antes (uma vez por aba): entrar com o
+          // Discord traz nome e foto; convidado entra na hora.
+          let decided = false;
+          try {
+            decided = sessionStorage.getItem("fixaComoConvidado") === "1";
+          } catch {
+            // armazenamento indisponível: pergunta de novo, sem problema
+          }
+          if (fresh.user.id.startsWith("guest-") && !decided) setChooseIdentity(true);
+          else await enterGuildRoom(fresh.identity);
+        } else if (guild) {
           if (fresh.user.id.startsWith("guest-")) setNeedsLogin(true);
           else await enterGuildRoom(fresh.identity);
         }
@@ -557,12 +586,12 @@ export function Room({ guild }: { guild?: string } = {}) {
       alive = false;
       clearTimeout(watchdog);
     };
-  }, [inDiscord, api, joinCallRoom, enterGuildRoom, enterLinkedRoom, guild]);
+  }, [inDiscord, api, joinCallRoom, enterGuildRoom, enterLinkedRoom, guild, fixa]);
 
   // ------------------------------------------------------------- o lobby
 
   useEffect(() => {
-    if (inDiscord || guild || inRoom) return;
+    if (inDiscord || byAddress || inRoom) return;
 
     let alive = true;
     const refresh = async () => {
@@ -586,7 +615,7 @@ export function Room({ guild }: { guild?: string } = {}) {
       alive = false;
       clearInterval(t);
     };
-  }, [inDiscord, guild, inRoom, modalOpen, askingPassword, api, session]);
+  }, [inDiscord, byAddress, inRoom, modalOpen, askingPassword, api, session]);
 
   async function handleEnter(target: RoomSummary, password?: string) {
     if (!session) return;
@@ -722,10 +751,15 @@ export function Room({ guild }: { guild?: string } = {}) {
       const guest = await authGuest(api);
       saveBadge(guest.identity);
       setSession(guest);
+      // No link fixo não há lobby para onde voltar: a tela de escolha volta.
+      if (fixa) {
+        setEntrada(null);
+        setChooseIdentity(true);
+      }
     } catch {
       setBootFailure("Saí da conta, mas não consegui abrir uma sessão de convidado.");
     }
-  }, [api, guild, leaveRoom]);
+  }, [api, guild, fixa, leaveRoom]);
 
   function renameSelf(name: string) {
     const clean = normalizeName(name);
@@ -794,7 +828,9 @@ export function Room({ guild }: { guild?: string } = {}) {
             {entrada.roomName ?? "Sala da call"}
           </h1>
           <p className="mt-2 text-suave">
-            Você continua na call do Discord. Pode voltar quando quiser.
+            {fixa
+              ? "Pode voltar quando quiser — o link continua o mesmo."
+              : "Você continua na call do Discord. Pode voltar quando quiser."}
           </p>
           <div className="mt-4 flex flex-wrap justify-center gap-2">
             <Link
@@ -843,7 +879,7 @@ export function Room({ guild }: { guild?: string } = {}) {
               Salas de convidados
             </Link>
             <a
-              href={`/auth/login?goBack=${encodeURIComponent(`/${guild ?? ""}`)}`}
+              href={`/auth/login?goBack=${encodeURIComponent(backHere)}`}
               className="inline-block rounded-full bg-acento px-5 py-2.5 text-[14px]/none font-medium text-white hover:bg-acento-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-texto"
             >
               Voltar para a sala
@@ -878,6 +914,45 @@ export function Room({ guild }: { guild?: string } = {}) {
     );
   }
 
+  if (chooseIdentity && session) {
+    return (
+      <main className="grid h-dvh place-items-center p-respiro text-center">
+        <div className="max-w-md">
+          <p className="text-[13px] text-suave">Sala</p>
+          <h1 className="mt-1 text-xl font-semibold text-texto">
+            {fixa ? fixa.replace(/-+/g, " ").replace(/^./, (c) => c.toUpperCase()) : "Sala"}
+          </h1>
+          <p className="mt-2 text-suave">
+            Entre com o Discord para aparecer com seu nome e sua foto, ou entre como convidado.
+          </p>
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  sessionStorage.setItem("fixaComoConvidado", "1");
+                } catch {
+                  // sem armazenamento, só não lembra a escolha
+                }
+                setChooseIdentity(false);
+                void enterGuildRoom(session.identity);
+              }}
+              className="rounded-full bg-tile px-5 py-2.5 text-[14px]/none font-medium text-texto hover:bg-tile-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-texto"
+            >
+              Entrar como convidado
+            </button>
+            <a
+              href={`/auth/login?goBack=${encodeURIComponent(backHere)}`}
+              className="inline-block rounded-full bg-acento px-5 py-2.5 text-[14px]/none font-medium text-white hover:bg-acento-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-texto"
+            >
+              Entrar com Discord
+            </a>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   if (needsLogin) {
     return (
       <main className="grid h-dvh place-items-center p-respiro text-center">
@@ -907,7 +982,7 @@ export function Room({ guild }: { guild?: string } = {}) {
               volta fica aqui — sem recarregar a página (RN-SES-3). E a saída
               para a raiz também: sem ela esta tela é um beco, e a única forma
               de sair seria editar o endereço. */}
-          {guild && session ? (
+          {byAddress && session ? (
             <div className="mt-4 flex flex-wrap justify-center gap-2">
               <Link
                 href="/"
@@ -1056,6 +1131,8 @@ export function Room({ guild }: { guild?: string } = {}) {
               }
             />
           )
+        ) : fixa ? (
+          <Panel title="Abrindo a sala…" text="Só um instante." />
         ) : guild ? (
           // No link de servidor nunca há lobby: a sala é a da call, criada
           // sozinha por quem entra nela. Oferecer "criar sala" aqui daria uma
