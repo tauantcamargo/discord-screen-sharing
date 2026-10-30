@@ -70,8 +70,9 @@ export function Capture() {
     [params]
   );
 
-  // Transmitir exige Chromium (RN-TRX-4). Celular não transmite em navegador
-  // nenhum (RN-TRX-5), e a mensagem precisa dizer isso — não um error genérico.
+  // Qualquer navegador desktop com WebCodecs transmite (Chromium e Safari 18+
+  // leem os quadros direto; o resto, via <video>). Celular não transmite em
+  // navegador nenhum (RN-TRX-5), e a mensagem precisa dizer isso.
   const blocker = !inBrowser
     ? null
     : !options.token
@@ -444,7 +445,7 @@ export function Capture() {
             <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-[13px]">
               <Row label="Codec" value={status.codec} />
               <Row label="Resolução" value={`${status.width}×${status.height}`} />
-              <Row label="Capture" value={status.direct ? "direta (Chromium)" : "via vídeo"} />
+              <Row label="Capture" value={status.direct ? "direta" : "via vídeo"} />
               {stats ? (
                 <>
                   <Row label="Assistindo" value={String(stats.viewers)} />

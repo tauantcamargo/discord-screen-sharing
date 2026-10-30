@@ -13,13 +13,18 @@ import { NextResponse, type NextRequest } from 'next/server';
  */
 const GUILD_ID_PATTERN = /^\/[0-9]{15,21}$/;
 
+/** Link fixo, `/s/<nome>` — mesmo formato que o servidor aceita. */
+const FIXED_PATTERN = /^\/s\/[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+
 /** O que existe de verdade na raiz. Rota nova = mais uma entrada aqui. */
 const KNOWN_ROUTES = new Set(['/', '/share', '/termos', '/privacidade']);
 
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  if (KNOWN_ROUTES.has(pathname) || GUILD_ID_PATTERN.test(pathname)) return NextResponse.next();
+  if (KNOWN_ROUTES.has(pathname) || GUILD_ID_PATTERN.test(pathname) || FIXED_PATTERN.test(pathname)) {
+    return NextResponse.next();
+  }
 
   return new NextResponse('Não encontrado.', {
     status: 404,
@@ -33,5 +38,5 @@ export const config = {
    * `/api/avatar/*` — passa longe daqui, e o custo por requisição continua zero
    * para o que mais aparece.
    */
-  matcher: ['/((?!_next|api|favicon).[^/]*)'],
+  matcher: ['/((?!_next|api|favicon).[^/]*)', '/s/:path*'],
 };

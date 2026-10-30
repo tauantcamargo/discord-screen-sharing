@@ -335,6 +335,28 @@ export function ensureCallRoom(
 }
 
 /**
+ * Sala de link fixo (`/s/<nome>`): um endereço estável para fixar num canal.
+ *
+ * Fora da lista pública (`isCall`), sem dono e sem senha — quem tem o link
+ * entra. Fecha ao esvaziar como qualquer sala e renasce na próxima visita.
+ *
+ * @returns null quando o teto global de salas foi atingido.
+ */
+export function ensureFixedRoom(slug: string): Room | null {
+  const id = `fixa-${slug}`;
+  const existing = rooms.get(id);
+  if (existing) return existing;
+  if (rooms.size >= MAX_ROOMS_TOTAL) return null;
+
+  const name = slug.replace(/-+/g, " ").replace(/^./, (c) => c.toUpperCase()).slice(0, MAX_ROOM_NAME);
+  const room = blankRoom(id, "fixa", name);
+  room.isCall = true;
+  room.ownerName = "link fixo";
+  rooms.set(id, room);
+  return room;
+}
+
+/**
  * Lista pública: nunca vaza hash de senha, só se ela existe.
  *
  * A sala automática da call fica de fora: dentro do Discord a atividade entra

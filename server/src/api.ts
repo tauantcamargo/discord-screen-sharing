@@ -338,6 +338,28 @@ const callRoom: Handler = async (ctx) => {
   json(ctx.res, 200, roomTokens(room.id, me));
 };
 
+/**
+ * A sala de um link fixo, `/s/<nome>` — o endereço que se fixa num canal.
+ *
+ * Não consulta o Discord: o link é a chave. Convidado entra; quem entrou com o
+ * Discord aparece com nome e foto.
+ */
+const FIXED_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+
+const fixedRoom: Handler = (ctx) => {
+  if (limited(ctx, 'fixed', 30, 60_000)) return;
+  const me = identityOf(ctx);
+  if (!me) return;
+
+  const slug = str(ctx.body.slug);
+  if (!slug || !FIXED_SLUG.test(slug)) return fail(ctx.res, 400, 'link de sala invalido');
+
+  const room = rooms.ensureFixedRoom(slug);
+  if (!room) return fail(ctx.res, 503, 'Limite de salas abertas atingido. Tente de novo em instantes.');
+
+  json(ctx.res, 200, { ...roomTokens(room.id, me), roomName: room.name });
+};
+
 const join: Handler = async (ctx) => {
   if (limited(ctx, 'join', 30, 60_000)) return;
   const me = identityOf(ctx);
@@ -403,8 +425,8 @@ const password: Handler = async (ctx) => {
  */
 function safeRedirect(raw: string | null): string {
   if (!raw) return '/';
-  // Só a raiz ou /<id de servidor>. Nada de "//" nem de esquema.
-  return /^\/[0-9]{0,21}$/.test(raw) ? raw : '/';
+  // Só a raiz, /<id de servidor> ou /s/<nome>. Nada de "//" nem de esquema.
+  return /^\/[0-9]{0,21}$/.test(raw) || /^\/s\/[a-z0-9-]{1,40}$/.test(raw) ? raw : '/';
 }
 
 /**
@@ -502,6 +524,7 @@ export const routes: Record<string, Handler> = {
   'POST /api/rooms/call': callRoom,
   'POST /api/rooms/guild': guildRoom,
   'POST /api/rooms/join': join,
+  'POST /api/rooms/fixed': fixedRoom,
   'POST /api/rooms/password': password,
 
   'GET /auth/login': login,

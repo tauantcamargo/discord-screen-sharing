@@ -58,6 +58,16 @@ export function guildRoom(
   );
 }
 
+/** A sala de um link fixo, `/s/<nome>`. Convidado também entra. */
+export function fixedRoom(
+  api: (path: string) => string,
+  identity: string,
+  slug: string,
+  renew: Renovar
+): Promise<RoomTokens> {
+  return post(api('/api/rooms/fixed'), { identity, slug }, { renew });
+}
+
 /** A sala fixa daquela call, criada na primeira pessoa que chega (RF-SAL-1). */
 export function callRoom(
   api: (path: string) => string,
