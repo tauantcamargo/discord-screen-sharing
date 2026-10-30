@@ -1,0 +1,79 @@
+# Publica a imagem da Sala de Tela.
+#
+# - Sempre no GitHub Container Registry (ghcr.io), com o token que o próprio
+#   Actions já tem. Depois do primeiro envio, deixe o pacote público em
+#   github.com/<você>?tab=packages → sala-de-tela → Package settings.
+# - No Docker Hub também, quando os segredos DOCKERHUB_USERNAME e
+#   DOCKERHUB_TOKEN existirem (Settings → Secrets and variables → Actions).
+#   O token é um Personal Access Token do Docker Hub com permissão de escrita.
+#
+# Tags: `latest` a cada push na main; `1.2.3`, `1.2` e `1` a cada tag `v1.2.3`.
+name: Imagem Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ARM junto: muita gente roda isto num Raspberry ou numa VPS ARM.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login no Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Nomes e tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/sala-de-tela
+            name=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/sala-de-tela,enable=${{ env.DOCKERHUB_USERNAME != '' }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=Sala de Tela
+            org.opencontainers.image.description=Compartilhamento de tela e câmera pelo navegador, com servidor próprio.
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
