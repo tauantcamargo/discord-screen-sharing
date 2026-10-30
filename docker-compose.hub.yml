@@ -1,0 +1,29 @@
+# Sala de Tela com a imagem pronta — sem clonar nem compilar nada.
+#
+#   1. Crie um .env ao lado deste arquivo (modelo abaixo).
+#   2. docker compose -f docker-compose.hub.yml up -d
+#   3. Ponha um proxy com HTTPS na frente da porta 3000 (Caddy, Traefik,
+#      Coolify, túnel da Cloudflare). O navegador só libera captura de tela
+#      em HTTPS.
+#
+# .env mínimo:
+#   SESSION_SECRET=<openssl rand -base64 32>
+#   PUBLIC_ORIGIN=https://tela.seudominio.com
+#
+# Opcional — login com o Discord (nome e foto). Crie um app em
+# discord.com/developers/applications e cadastre o redirect
+# https://tela.seudominio.com/auth/callback em OAuth2:
+#   DISCORD_CLIENT_ID=
+#   DISCORD_CLIENT_SECRET=
+services:
+  sala:
+    # Troque pelo seu usuário do Docker Hub, ou use a do GHCR:
+    #   ghcr.io/tauantcamargo/sala-de-tela:latest
+    image: ghcr.io/tauantcamargo/sala-de-tela:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"
+    # As salas vivem em memória: uma réplica só. ~100 MB parada; 256 MB sobra
+    # para um grupo de amigos.
+    mem_limit: 256m

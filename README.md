@@ -271,6 +271,48 @@ WebSocket.
 
 ---
 
+## Imagem pronta
+
+Para quem só quer usar, sem clonar nem compilar:
+
+```bash
+docker run -d --name sala-de-tela --restart unless-stopped \
+  -p 127.0.0.1:3000:3000 \
+  -e SESSION_SECRET="$(openssl rand -base64 32)" \
+  -e PUBLIC_ORIGIN=https://tela.seudominio.com \
+  ghcr.io/tauantcamargo/sala-de-tela:latest
+```
+
+Ou com o [`docker-compose.hub.yml`](docker-compose.hub.yml), que traz o modelo
+de `.env` comentado. Imagem para `amd64` e `arm64` (Raspberry, VPS ARM).
+
+| Variável | Obrigatória | Para quê |
+|---|---|---|
+| `SESSION_SECRET` | sim | Assina sessões e tokens de sala. `openssl rand -base64 32` |
+| `PUBLIC_ORIGIN` | sim | O endereço público, com `https://` e sem barra no fim |
+| `DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET` | não | Login com o Discord (nome e foto). Redirect: `{PUBLIC_ORIGIN}/auth/callback` |
+| `MAX_VIEWERS_PER_STREAM` | não | Teto de quem assiste cada tela (padrão 12) |
+
+Coloque um proxy com HTTPS na frente da porta 3000 — Caddy, Traefik, Coolify
+ou túnel da Cloudflare. O navegador só libera captura de tela em HTTPS, e o
+proxy precisa repassar WebSocket em `/ws`.
+
+**Recursos:** ~100 MB de RAM parada e CPU perto de zero; 256 MB sobra para um
+grupo de amigos. O gargalo é a banda de upload do servidor: cada pessoa
+assistindo recebe o vídeo inteiro de novo. Uma réplica só — as salas vivem em
+memória.
+
+**Como usar com a galera:** a voz fica na call do Discord e a tela abre no
+navegador. Fixe um link por canal de voz — `https://tela.seudominio.com/s/geral`,
+`/s/jogos`… — e quem abre cai direto na sala. No Brasil as Activities de vídeo
+estão suspensas por ordem da ANPD, então dentro do Discord a atividade não
+abre; o site funciona normalmente.
+
+A imagem é publicada pelo workflow [`docker.yml`](.github/workflows/docker.yml)
+a cada push na `main` (`latest`) e a cada tag `v*` (`1.2.3`, `1.2`, `1`).
+
+---
+
 ## Docker
 
 Uma imagem, dois contêineres: a aplicação e o túnel.
